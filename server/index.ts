@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { existsSync, statSync, createReadStream } from 'node:fs';
 import { resolve, extname, sep } from 'node:path';
-import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
+import { Agent, EnvHttpProxyAgent, fetch as directFetch, setGlobalDispatcher } from 'undici';
 import { createApi } from './api';
 // Load only server-side configuration; Vite never exposes these unprefixed values.
 if(existsSync('.env'))process.loadEnvFile('.env');
@@ -10,7 +10,11 @@ const portIndex=process.argv.indexOf('--port');
 const port=Number(portIndex>=0?process.argv[portIndex+1]:process.env.PORT??3000);
 if(!Number.isInteger(port)||port<1||port>65535)throw Error('Invalid port');
 const production=process.argv.includes('--production');
-const api=createApi({key:process.env.WORLDGEN_DEEPSEEK_KEY??process.env.DEEPSEEK_API_KEY,model:process.env.WORLDGEN_DEEPSEEK_MODEL??process.env.DEEPSEEK_MODEL});
+const localAgent=new Agent();
+const ollamaUrl=process.env.WORLDGEN_OLLAMA_URL??'http://127.0.0.1:11434';
+const parsedOllama=new URL(ollamaUrl);
+if(!['http:','https:'].includes(parsedOllama.protocol)||parsedOllama.username||parsedOllama.password||parsedOllama.search||parsedOllama.hash)throw Error('Invalid WORLDGEN_OLLAMA_URL');
+const api=createApi({key:process.env.WORLDGEN_DEEPSEEK_KEY??process.env.DEEPSEEK_API_KEY,model:process.env.WORLDGEN_DEEPSEEK_MODEL??process.env.DEEPSEEK_MODEL,ollamaUrl,localModel:process.env.WORLDGEN_LOCAL_MODEL??'qwen2.5-coder:7b',localFetcher:((url,init)=>directFetch(url as string,{...init,dispatcher:localAgent} as Parameters<typeof directFetch>[1])) as typeof fetch});
 const vite=production?null:await(await import('vite')).createServer({server:{middlewareMode:true},appType:'spa'});
 const dist=resolve('dist');
 if(production&&!existsSync(resolve(dist,'index.html')))throw Error('Run npm run build first');

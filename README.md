@@ -70,3 +70,20 @@ DeepSeek 生成通过服务端 `server/api.ts` 和共享的 `parseWorld` 校验�
 测试中的 DeepSeek 响应为模拟数据，不需要账户；通过这些测试并不代表真实模型访问已验证。
 
 DeepSeek 接口参考：[首次调用](https://api-docs.deepseek.com/) · [JSON Output](https://api-docs.deepseek.com/guides/json_mode)。此前的 `WORLDGEN_OPENAI_KEY` / `WORLDGEN_OPENAI_MODEL` 不再使用，也不会将 OpenAI 密钥发送到 DeepSeek。云环境设置里可以删除旧 OpenAI 配置要求。
+
+## 本地 Qwen 备用模型（Ollama）
+
+DeepSeek 返回 HTTP 402（余额不足）时，服务端自动尝试 Ollama 的 `qwen2.5-coder:7b`。未配置 DeepSeek 密钥时也直接尝试 Ollama。其他错误不会自动转发到本地模型。界面也可直接选择“本地 Qwen（Ollama）”，跳过 DeepSeek。模型结果使用同样的场景校验，错误不覆盖当前场景。
+
+在运行 WorldGen 后端的机器上安装 Ollama，并运行：
+
+```sh
+ollama serve # 如果后台服务已经运行，无需重复启动
+ollama pull qwen2.5-coder:7b
+# 另一个终端，从项目目录启动
+npm run dev -- --port 3000
+```
+
+默认 `WORLDGEN_OLLAMA_URL=http://127.0.0.1:11434`，`WORLDGEN_LOCAL_MODEL=qwen2.5-coder:7b`。可在 .env 或后端环境变量中覆盖，修改后重启 WorldGen。Ollama 请求使用独立直连连接池，不经过 DeepSeek 代理，也不携带 DeepSeek 密钥。支持 Ollama `/api/chat`，非流式、JSON schema 格式；本地推理超时 180 秒，浏览器总等待上限 250 秒。
+
+**云环境的 127.0.0.1 不是你的电脑。** 如果 Ollama 在个人电脑上，最简单的方法是在该电脑上运行整个 WorldGen 项目；否则需要提供云后端可访问的服务地址及安全网络通路。不要直接把无认证的 Ollama 服务暴露在公网。当前云环境未安装 Ollama，尚未验证真实 Qwen 推理；自动切换链路已用模拟模型响应测试。`/api/status` 的 localConfigured 仅表示有配置地址，不保证服务在线或模型已安装。

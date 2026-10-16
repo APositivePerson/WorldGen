@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parseWorld } from '../src/scene';
 import { sceneSchema, instructions } from './schema';
-export interface Options { key?:string; model?:string; fetcher?:typeof fetch }
+export interface Options { key?:string; model?:string; fetcher?:typeof fetch; ollamaUrl?:string; localModel?:string; localFetcher?:typeof fetch }
 class ApiError extends Error { constructor(public status:number,message:string){super(message);} }
 function send(res:ServerResponse,status:number,body:unknown){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(body));}
 export function createApi(options:Options){
@@ -9,7 +9,7 @@ export function createApi(options:Options){
  return async(req:IncomingMessage,res:ServerResponse):Promise<boolean>=>{
   const path=req.url?.split('?')[0];if(!path?.startsWith('/api/'))return false;
   try{
-   if(path==='/api/status'&&req.method==='GET'){send(res,200,{configured:!!options.key,model:options.model??'deepseek-flash'});return true;}
+   if(path==='/api/status'&&req.method==='GET'){send(res,200,{configured:!!options.key,model:options.model??'deepseek-flash',localModel:options.localModel??'qwen2.5-coder:7b',localConfigured:!!options.ollamaUrl});return true;}
    if(path!=='/api/world'){throw new ApiError(404,'接口不存在。');}
    if(req.method!=='POST')throw new ApiError(405,'请使用 POST 请求。');
    if(req.headers.origin){let host;try{host=new URL(req.headers.origin).host;}catch{throw new ApiError(403,'无效来源。');}if(host!==req.headers.host)throw new ApiError(403,'不允许跨站请求。');}
@@ -19,14 +19,27 @@ export function createApi(options:Options){
    let body;try{body=JSON.parse(raw);}catch{throw new ApiError(400,'请求 JSON 无效。');}
    if(!body||typeof body.prompt!=='string'||!body.prompt.trim()||body.prompt.length>4000||!['generate','edit'].includes(body.mode))throw new ApiError(400,'请提供 1–4000 字的提示词和有效操作模式。');
    let world;if(body.mode==='edit'){try{world=parseWorld(JSON.stringify(body.world));}catch{throw new ApiError(400,'当前场景数据无效。');}}
-   if(!options.key)throw new ApiError(503,'尚未配置 DeepSeek 密钥。请在服务端设置 WORLDGEN_DEEPSEEK_KEY 后重启，或切换本地规则模式。');
+   const localRequested=body.provider==='ollama';
+   if(body.provider!==undefined&&!['ollama','auto'].includes(body.provider))throw new ApiError(400,'无效的模型服务。');
+   if(!options.key&&!options.ollamaUrl)throw new ApiError(503,'尚未配置 DeepSeek 密钥。请在服务端设置 WORLDGEN_DEEPSEEK_KEY 后重启，或切换本地规则模式。');
    active++;
    try{
+    const messages=[{role:'system',content:instructions+'\nJSON schema for the required scene:\n'+JSON.stringify(sceneSchema)},{role:'user',content:JSON.stringify({mode:body.mode,prompt:body.prompt,world,selectedId:typeof body.selectedId==='string'?body.selectedId:null})}];
+    const runLocal=async(fallback:boolean)=>{
+     if(!options.ollamaUrl)throw new ApiError(503,'本地 Ollama 未配置，请设置 WORLDGEN_OLLAMA_URL。');
+     let response:Response;
+     try{response=await(options.localFetcher??options.fetcher??fetch)(options.ollamaUrl.replace(/\/$/,'')+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(180000),body:JSON.stringify({model:options.localModel??'qwen2.5-coder:7b',messages,stream:false,format:sceneSchema,options:{temperature:0.2,num_predict:8192,num_ctx:16384}})});}catch{throw new ApiError(503,fallback?'DeepSeek 余额不足，且无法连接本地 Ollama；原场景已保留。':'无法连接 Ollama 或本地推理超时，请检查地址和服务。');}
+     if(!response.ok)throw new ApiError(502,response.status===404?'Ollama 模型未安装，请运行 ollama pull qwen2.5-coder:7b。':'Ollama 推理失败，请检查服务状态。');
+     let result;try{const data=await response.json();if(data.done!==true||data.done_reason==='length')throw Error();result=parseWorld(data.message?.content);}catch{throw new ApiError(422,'本地模型输出未完成或未通过场景校验，原场景已保留。');}
+     send(res,200,{world:result,provider:'ollama',model:options.localModel??'qwen2.5-coder:7b',fallback});
+    };
+    if(localRequested||!options.key){await runLocal(false);return true;}
     let upstream:Response;
     try{upstream=await(options.fetcher??fetch)('https://api.deepseek.com/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${options.key}`,'Content-Type':'application/json'},signal:AbortSignal.timeout(60_000),body:JSON.stringify({model:options.model??'deepseek-flash',max_tokens:8192,thinking:{type:'disabled'},messages:[{role:'system',content:instructions+'\nJSON schema for the required scene:\n'+JSON.stringify(sceneSchema)},{role:'user',content:JSON.stringify({mode:body.mode,prompt:body.prompt,world,selectedId:typeof body.selectedId==='string'?body.selectedId:null})}],response_format:{type:'json_object'}})});}catch(error){throw new ApiError(504,error instanceof Error&&/timeout|abort/i.test(error.name)?'DeepSeek 请求超时，请稍后重试。':'无法连接 DeepSeek，请检查服务端网络。');}
+    if(upstream.status===402&&options.ollamaUrl){await runLocal(true);return true;}
     if(!upstream.ok){throw new ApiError(upstream.status===429?429:502,upstream.status===401?'DeepSeek 认证失败，请检查服务端密钥。':upstream.status===402?'DeepSeek 账户余额不足，请充值后重试。':upstream.status===429?'DeepSeek 请求过于频繁，请稍后重试。':upstream.status===403?'DeepSeek 拒绝访问，请检查账户权限或网络策略。':'DeepSeek 服务请求失败，请检查模型配置后重试。');}
     let result;try{const data=await upstream.json();const choice=data.choices?.[0];if(choice?.message?.refusal)throw new ApiError(422,'模型拒绝了此请求，请调整描述。');if(choice?.finish_reason!=='stop')throw new ApiError(422,'模型输出未完成，请简化场景后重试。');result=parseWorld(choice.message.content);}catch(error){if(error instanceof ApiError)throw error;throw new ApiError(422,'模型输出未通过场景校验；原场景已保留，请重试。');}
-    send(res,200,{world:result,model:options.model??'deepseek-flash'});
+    send(res,200,{world:result,model:options.model??'deepseek-flash',provider:'deepseek',fallback:false});
    }finally{active--;}
   }catch(error){send(res,error instanceof ApiError?error.status:500,{error:error instanceof ApiError?error.message:'场景服务发生错误。'});}
   return true;
