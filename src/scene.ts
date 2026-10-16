@@ -31,7 +31,7 @@ export const distance = (a: SceneObject,b: SceneObject) => Math.hypot(...a.posit
 export function parseWorld(text:string):World {
  const w = JSON.parse(text);
  const vec=(v:unknown,n:number)=>Array.isArray(v)&&v.length===n&&v.every(x=>typeof x==='number'&&Number.isFinite(x)&&Math.abs(x)<=1000);
- if(w.version!==1||w.units!=='meters'||w.upAxis!=='Z'||typeof w.name!=='string'||!vec(w.dimensions,2)||w.dimensions.some((v:number)=>v<4||v>40)||!Array.isArray(w.objects)||w.objects.length>200) throw Error('场景格式无效：需要 v1、米制、Z-up，房间尺寸 4–40 米，最多 200 个物体。');
+ if(!w||typeof w!=='object'||w.version!==1||w.units!=='meters'||w.upAxis!=='Z'||typeof w.name!=='string'||!vec(w.dimensions,2)||w.dimensions.some((v:number)=>v<4||v>40)||!Array.isArray(w.objects)||w.objects.length>200) throw Error('场景格式无效：需要 v1、米制、Z-up，房间尺寸 4–40 米，最多 200 个物体。');
  const ids = new Set();
  for(const o of w.objects) { if(!o||typeof o.id!=='string'||ids.has(o.id)||typeof o.name!=='string'||!Object.hasOwn(specs,o.kind)||!vec(o.position,3)||!vec(o.size,3)||o.size.some((v:number)=>v<=0||v>40)||!Number.isFinite(o.rotation)||typeof o.color!=='string'||!/^#[0-9a-f]{6}$/i.test(o.color)) throw Error('物体数据无效：请检查 ID、坐标、尺寸及颜色。'); ids.add(o.id); }
  return w;
