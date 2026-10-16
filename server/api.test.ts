@@ -6,7 +6,7 @@ import { createApi, type Options } from './api';
 import { generate, initialPrompt } from '../src/scene';
 async function withServer(options:Options,run:(base:string)=>Promise<void>){const api=createApi(options);const s=createServer((q,r)=>{void api(q,r);});await new Promise<void>(r=>s.listen(0,'127.0.0.1',r));try{await run(`http://127.0.0.1:${(s.address() as AddressInfo).port}`);}finally{await new Promise<void>((r,j)=>s.close(e=>e?j(e):r()));}}
 const post=(base:string,body:unknown)=>fetch(base+'/api/world',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-const world=generate(initialPrompt);
+const world={...generate(initialPrompt),environment:'indoor' as const};
 const completion=(value:unknown)=>new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(value)}}]}));
 test('missing credential is explicit and never sent to browser',async()=>{await withServer({},async base=>{const status=await(await fetch(base+'/api/status')).json();assert.equal(status.configured,false);const response=await post(base,{mode:'generate',prompt:'房间'});assert.equal(response.status,503);});});
 test('uses server credential and structured output, returns validated world',async()=>{let called=false;await withServer({key:'test-secret',fetcher:async(url,init)=>{called=true;assert.equal(url,'https://api.deepseek.com/chat/completions');assert.equal((init?.headers as Record<string,string>).Authorization,'Bearer test-secret');const body=JSON.parse(init?.body as string);assert.deepEqual(body.response_format,{type:'json_object'});assert.equal(body.model,'deepseek-flash');assert.equal(body.max_tokens,8192);assert.ok(!('max_completion_tokens' in body));assert.ok(body.messages[0].content.includes('JSON schema'));assert.ok(body.messages[0].content.includes('additionalProperties'));return completion(world);}},async base=>{const response=await post(base,{mode:'generate',prompt:'会议室'});assert.equal(response.status,200);const text=await response.text();assert.ok(!text.includes('test-secret'));assert.deepEqual(JSON.parse(text).world,world);});assert.ok(called);});
@@ -21,7 +21,18 @@ test('explicit local mode bypasses DeepSeek and validates output',async()=>{
  await withServer({key:'unused',ollamaUrl:'http://127.0.0.1:11434',fetcher:async()=>{throw Error('DeepSeek must not be called');},localFetcher:async()=>new Response(JSON.stringify({done:true,message:{content:JSON.stringify(world)}}))},async base=>{const r=await post(base,{mode:'generate',provider:'ollama',prompt:'房间'});assert.equal(r.status,200);assert.equal((await r.json()).fallback,false);});
 });
 test('local errors never replace scene and non-balance upstream failures do not fallback',async()=>{
- for(const upstream of [new Response('',{status:404}),new Response(JSON.stringify({done:true,done_reason:'length',message:{content:'{}'}})),new Response(JSON.stringify({done:true,message:{content:'invalid'}}))])await withServer({ollamaUrl:'http://127.0.0.1:11434',localFetcher:async()=>upstream},async base=>{const r=await post(base,{mode:'generate',provider:'ollama',prompt:'房间'});assert.ok(r.status>=400);assert.ok(!('world' in await r.json()));});
+ for(const upstream of [new Response('',{status:404}),new Response(JSON.stringify({done:true,done_reason:'length',message:{content:'{}'}})),new Response(JSON.stringify({done:true,message:{content:'invalid'}}))])await withServer({ollamaUrl:'http://127.0.0.1:11434',localFetcher:async()=>upstream.clone()},async base=>{const r=await post(base,{mode:'generate',provider:'ollama',prompt:'房间'});assert.ok(r.status>=400);assert.ok(!('world' in await r.json()));});
  await withServer({key:'test',ollamaUrl:'http://127.0.0.1:11434',fetcher:async()=>new Response('',{status:401}),localFetcher:async()=>{throw Error('must not fallback');}},async base=>{assert.equal((await post(base,{mode:'generate',prompt:'房间'})).status,502);});
- await withServer({key:'test',ollamaUrl:'http://127.0.0.1:11434',fetcher:async()=>new Response('',{status:402}),localFetcher:async()=>{throw Error('connection refused');}},async base=>{const r=await post(base,{mode:'generate',prompt:'房间'});assert.equal(r.status,503);assert.match((await r.json()).error,/余额不足.*无法连接/);});
+ await withServer({key:'test',ollamaUrl:'http://127.0.0.1:11434',fetcher:async()=>new Response('',{status:402}),localFetcher:async()=>{throw Error('connection refused');}},async base=>{const r=await post(base,{mode:'generate',prompt:'房间'});assert.equal(r.status,503);assert.match((await r.json()).error,/余额不足.*连接失败/);});
+});
+
+test('local invalid output triggers one repair with targeted feedback',async()=>{
+ let calls=0;await withServer({ollamaUrl:'http://localhost:11434',localFetcher:async(_,init)=>{
+  const body=JSON.parse(init?.body as string);calls++;assert.ok(body.format.required.includes('environment'));assert.equal(body.format.properties.objects.maxItems,24);
+  if(calls===1)return new Response(JSON.stringify({done:true,message:{content:JSON.stringify({...world,environment:undefined})}}));
+  assert.match(body.messages.at(-1).content,/environment/);return new Response(JSON.stringify({done:true,message:{content:JSON.stringify(world)}}));
+ }},async base=>{const r=await post(base,{mode:'generate',provider:'ollama',prompt:'房间'});assert.equal(r.status,200);assert.deepEqual((await r.json()).world,world);});assert.equal(calls,2);
+});
+test('local exhausted repair reports exact field and retains original world',async()=>{
+ let calls=0;await withServer({ollamaUrl:'http://localhost:11434',localFetcher:async()=>{calls++;const invalid=structuredClone(world);invalid.objects[0].size=[0,1,1];return new Response(JSON.stringify({done:true,message:{content:JSON.stringify(invalid)}}));}},async base=>{const r=await post(base,{mode:'edit',provider:'ollama',world,prompt:'修改桌子'});assert.equal(r.status,422);const data=await r.json();assert.match(data.error,/objects\[0\]\.size/);assert.ok(!data.world);});assert.equal(calls,2);
 });

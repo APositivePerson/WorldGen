@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { parseWorld } from '../src/scene';
+import { parseWorld, type World } from '../src/scene';
 import { sceneSchema, instructions } from './schema';
+import { localSchema, readLocalWorld, LocalOutputError } from './local-scene';
 export interface Options { key?:string; model?:string; fetcher?:typeof fetch; ollamaUrl?:string; localModel?:string; localFetcher?:typeof fetch }
 class ApiError extends Error { constructor(public status:number,message:string){super(message);} }
 function send(res:ServerResponse,status:number,body:unknown){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(body));}
@@ -18,7 +19,7 @@ export function createApi(options:Options){
    let raw='';for await(const chunk of req){raw+=chunk.toString();if(Buffer.byteLength(raw)>1_000_000)throw new ApiError(413,'场景请求过大。');}
    let body;try{body=JSON.parse(raw);}catch{throw new ApiError(400,'请求 JSON 无效。');}
    if(!body||typeof body.prompt!=='string'||!body.prompt.trim()||body.prompt.length>4000||!['generate','edit'].includes(body.mode))throw new ApiError(400,'请提供 1–4000 字的提示词和有效操作模式。');
-   let world;if(body.mode==='edit'){try{world=parseWorld(JSON.stringify(body.world));}catch{throw new ApiError(400,'当前场景数据无效。');}}
+   let world:World|undefined;if(body.mode==='edit'){try{world=parseWorld(JSON.stringify(body.world));}catch{throw new ApiError(400,'当前场景数据无效。');}}
    const localRequested=body.provider==='ollama';
    if(body.provider!==undefined&&!['ollama','auto'].includes(body.provider))throw new ApiError(400,'无效的模型服务。');
    if(!options.key&&!options.ollamaUrl)throw new ApiError(503,'尚未配置 DeepSeek 密钥。请在服务端设置 WORLDGEN_DEEPSEEK_KEY 后重启，或切换本地规则模式。');
@@ -27,10 +28,17 @@ export function createApi(options:Options){
     const messages=[{role:'system',content:instructions+'\nJSON schema for the required scene:\n'+JSON.stringify(sceneSchema)},{role:'user',content:JSON.stringify({mode:body.mode,prompt:body.prompt,world,selectedId:typeof body.selectedId==='string'?body.selectedId:null})}];
     const runLocal=async(fallback:boolean)=>{
      if(!options.ollamaUrl)throw new ApiError(503,'本地 Ollama 未配置，请设置 WORLDGEN_OLLAMA_URL。');
-     let response:Response;
-     try{response=await(options.localFetcher??options.fetcher??fetch)(options.ollamaUrl.replace(/\/$/,'')+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(180000),body:JSON.stringify({model:options.localModel??'qwen2.5-coder:7b',messages,stream:false,format:sceneSchema,options:{temperature:0.2,num_predict:8192,num_ctx:16384}})});}catch{throw new ApiError(503,fallback?'DeepSeek 余额不足，且无法连接本地 Ollama；原场景已保留。':'无法连接 Ollama 或本地推理超时，请检查地址和服务。');}
-     if(!response.ok)throw new ApiError(502,response.status===404?'Ollama 模型未安装，请运行 ollama pull qwen2.5-coder:7b。':'Ollama 推理失败，请检查服务状态。');
-     let result;try{const data=await response.json();if(data.done!==true||data.done_reason==='length')throw Error();result=parseWorld(data.message?.content);}catch{throw new ApiError(422,'本地模型输出未完成或未通过场景校验，原场景已保留。');}
+     const outdoor=body.mode==='edit'?world?.environment==='outdoor':/景区|湖|公园|室外|户外|park|lake|outdoor/i.test(body.prompt);
+     const schema=localSchema(outdoor,body.mode==='edit');
+     const localMessages=[{role:'system',content:instructions+'\nOUTPUT CONSTRAINTS: environment must be '+(outdoor?'outdoor':'indoor')+'. All dimensions, positions and sizes are NUMBER ARRAYS, never objects. Use #RRGGBB colors. Return one complete JSON object, no markdown. '+(body.mode==='generate'?'Generate no more than 24 objects; avoid repetitive decorative trees to fit the output budget.':'Preserve all existing objects unrelated to the edit. Do not drop objects to shorten output.')+'\nJSON Schema:\n'+JSON.stringify(schema)},messages[1]];
+     const signal=AbortSignal.timeout(180000);let result;let reason='未知格式错误';
+     for(let attempt=0;attempt<2;attempt++){
+      let response:Response;
+      try{response=await(options.localFetcher??options.fetcher??fetch)(options.ollamaUrl.replace(/\/$/,'')+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal,body:JSON.stringify({model:options.localModel??'qwen2.5-coder:7b',messages:attempt===0?localMessages:[...localMessages,{role:'user',content:'上一次输出未能通过检查：'+reason+'。请重新完成原任务并修正此问题。必须返回完整场景 JSON，不要解释。'+(body.mode==='generate'?'减少装饰物，保持最多 24 个物体。':'保留所有与编辑无关的原物体。')}],stream:false,format:schema,options:{temperature:0,num_predict:8192,num_ctx:16384}})});}catch{throw new ApiError(503,fallback?'DeepSeek 余额不足，且本地 Ollama 连接失败或推理超时；原场景已保留。':'Ollama 连接失败或本地推理超时，请检查服务；原场景已保留。');}
+      if(!response.ok)throw new ApiError(502,response.status===404?'Ollama 模型未安装，请运行 ollama pull qwen2.5-coder:7b。':'Ollama 推理失败，请检查服务状态。');
+      try{result=readLocalWorld(await response.json());break;}catch(error){reason=error instanceof LocalOutputError?error.message:'Ollama 响应不是合法 JSON';}
+     }
+     if(!result)throw new ApiError(422,'本地模型自动修复后仍未通过检查：'+reason+'。原场景已保留；请减少物体数量后重试。');
      send(res,200,{world:result,provider:'ollama',model:options.localModel??'qwen2.5-coder:7b',fallback});
     };
     if(localRequested||!options.key){await runLocal(false);return true;}

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx server/index.ts",
     "build": "tsc && vite build",
-    "test": "tsx --test src/scene.test.ts server/api.test.ts",
+    "test": "tsx --test src/scene.test.ts server/*.test.ts",
     "preview": "vite preview --host 0.0.0.0",
     "start": "tsx server/index.ts --production"
   },
